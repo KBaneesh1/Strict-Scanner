@@ -7,6 +7,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#define BLOCK_X 
+#define BLOCK_Y 1000
 #pragma pack(1)
 typedef struct {
     unsigned short bfType;
@@ -36,6 +38,39 @@ typedef struct {
 // that particular part of the image on which it is being overlayed
 float SIMILARITY_THRESHOLD = 1.0;
 
+__global__ void st_scan(uint8_t *cuda_image,uint8_t *cuda_token , bool*cuda_match ,float *err_cuda)
+{
+    uint32_t b_x = gridDim.x;
+    uint32_t b_y = gridDim.y;
+    uint32_t x_bl_dim = blockDim.x;
+    uint32_t y_bl_dim = blockDim.y;
+
+    uint32_t t_x = threadIdx.x;
+    uint32_t t_y = threadIdx.y;
+    uint32_t t_x_dim = blockDim.x;
+    uint32_t t_y_dim = blockDim.y;
+
+    __shared__ uint32_t sm[BLOCK_X * BLOCK_Y];
+    __shared__ float total;
+
+    sm[t_x * t_y_dim + t_y] = abs(cuda_image[(b_x + t_x)* (y_bl_dim + t_y_dim - 1) + (b_y + t_y) ] - cuda_token[t_x * t_y_dim +  t_y]);
+
+    __syncthreads();
+
+    if (t_x == 0 && t_y == 0) {
+        total = 0.0;
+        for (uint32_t i = 0; i < t_x_dim * t_y_dim; i++) {
+            total += sm[i];
+        }
+    }
+    
+    __syncthreads();
+    if (t_x == 0 && t_y == 0 && total <= *err_cuda) {
+        cuda_match[b_x * (y_bl_dim + t_y_dim - 1) + b_y] = true;
+    }
+    return;
+
+}
 // Strict scan that compares the token with the image pixel by pixel
 // WARNING: Note that X*Y is basically an M*N matrix, where 
 // M (X) is the height/vertical and N (Y) is the width/horizontal
@@ -48,8 +83,33 @@ int strict_scan(
     float error_threshold = (1 - match_similarity_threshold) * 255 * token_dimy * token_dimx;
     printf("Error threshold: %f\n", error_threshold);
 
+    uint8_t *cuda_image,*cuda_token;
+    float * err_cuda;
+    bool *cuda_match;
 
+    //Initializing cuda memory
+    cudaMalloc((void**)&cuda_image, image_dimx * image_dimy * sizeof(uint8_t));
+    cudaMalloc((void**)&cuda_token, token_dimx * token_dimy* sizeof(uint8_t));
+    cudaMalloc((void**)&cuda_match,image_dimx*image_dimy*sizeof(bool));
+    cudaMalloc((void**)&err_cuda , sizeof(float));
+
+    //assigning cuda matrices
+    cudaMemcpy(cuda_image, &image, image_dimx * image_dimy * sizeof(uint8_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(cuda_token, &token, token_dimx * token_dimy * sizeof(uint8_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(cuda_match, &match_matrix, image_dimx * image_dimy * sizeof(bool), cudaMemcpyHostToDevice);
+    cudaMemcpy(err_cuda, &error_threshold, 1 * sizeof(float), cudaMemcpyHostToDevice);
     
+    dim3 gridSize(image_dimx-token_dimx+1,image_dimy-token_dimy+1);
+    dim3 threads_per_block(token_dimx,token_dimy);
+    st_scan<<<gridSize,threads_per_block>>>(cuda_image,cuda_token,match_matrix,err_cuda);
+
+    // cudaMemcpy(cuda_match,&match_matrix)
+
+    cudaMemcpy(match_matrix, cuda_match, image_dimx * image_dimy * sizeof(uint8_t), cudaMemcpyDeviceToHost);  
+    cudaFree(cuda_image);
+    cudaFree(cuda_match);
+    cudaFree(cuda_token);
+
     return 0;
 }
 
@@ -85,7 +145,8 @@ int setup_bmp(char* bmp_image_file_path, uint8_t** image, uint32_t* image_dimx, 
         *image = (uint8_t *)((char *)*mapped + bmfh->bfOffBits);
 
         //copy the image to image
-    } else {
+    } 
+    else {
         printf("The image is not an 8-bit grayscale bitmap.\n");
         return 1;
     }
@@ -169,6 +230,9 @@ int main(int argc, char *argv[]) {
             }
         }
     }
+    delete image;
+    delete scan;
+    delete match_matrix;
 
     return 0;
 }
